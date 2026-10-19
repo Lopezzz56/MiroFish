@@ -30,6 +30,16 @@ def _get_storage():
     return storage
 
 
+def _has_active_graph_task(task_id):
+    if not task_id:
+        return False
+    task = TaskManager().get_task(task_id)
+    return task is not None and task.status in (
+        TaskStatus.PENDING,
+        TaskStatus.PROCESSING,
+    )
+
+
 def allowed_file(filename: str) -> bool:
     """Check if file extension is allowed"""
     if not filename or '.' not in filename:
@@ -255,6 +265,7 @@ def generate_ontology():
         })
         
     except Exception as e:
+        logger.exception("Ontology generation failed")
         return jsonify({
             "success": False,
             "error": str(e),
@@ -319,11 +330,20 @@ def build_graph():
             }), 400
 
         if project.status == ProjectStatus.GRAPH_BUILDING and not force:
-            return jsonify({
-                "success": False,
-                "error": "Graph is being built. Do not submit repeatedly. To force rebuild, add force: true",
-                "task_id": project.graph_build_task_id
-            }), 400
+            if _has_active_graph_task(project.graph_build_task_id):
+                return jsonify({
+                    "success": False,
+                    "error": "Graph is being built. Do not submit repeatedly. To force rebuild, add force: true",
+                    "task_id": project.graph_build_task_id
+                }), 400
+            logger.warning(
+                "Project %s has a stale graph-build task %s; allowing retry",
+                project_id,
+                project.graph_build_task_id,
+            )
+            project.status = ProjectStatus.FAILED
+            project.error = "Previous graph-build task is no longer active; retrying."
+            ProjectManager.save_project(project)
 
         # If force rebuild, reset status
         if force and project.status in [ProjectStatus.GRAPH_BUILDING, ProjectStatus.FAILED, ProjectStatus.GRAPH_COMPLETED]:
@@ -334,8 +354,23 @@ def build_graph():
 
         # Get configuration
         graph_name = data.get('graph_name', project.name or 'MiroFish Graph')
-        chunk_size = data.get('chunk_size', project.chunk_size or Config.DEFAULT_CHUNK_SIZE)
-        chunk_overlap = data.get('chunk_overlap', project.chunk_overlap or Config.DEFAULT_CHUNK_OVERLAP)
+        try:
+            chunk_size = int(data.get('chunk_size', Config.DEFAULT_CHUNK_SIZE))
+            chunk_overlap = int(
+                data.get('chunk_overlap', Config.DEFAULT_CHUNK_OVERLAP)
+            )
+        except (TypeError, ValueError):
+            return jsonify({
+                "success": False,
+                "error": "chunk_size and chunk_overlap must be integers"
+            }), 400
+
+        if chunk_size <= 0 or chunk_overlap < 0 or chunk_overlap >= chunk_size:
+            return jsonify({
+                "success": False,
+                "error": "chunk_size must be positive and chunk_overlap must be "
+                         "non-negative and smaller than chunk_size"
+            }), 400
 
         # Update project configuration
         project.chunk_size = chunk_size
@@ -368,6 +403,7 @@ def build_graph():
         # Update project status
         project.status = ProjectStatus.GRAPH_BUILDING
         project.graph_build_task_id = task_id
+        project.error = None
         ProjectManager.save_project(project)
 
         # Start background task

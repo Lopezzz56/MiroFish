@@ -199,11 +199,7 @@ class Neo4jStorage(GraphStorage):
         all_embeddings: list = []
         if all_texts_to_embed:
             logger.info(f"[add_text] Batch-embedding {len(all_texts_to_embed)} texts...")
-            try:
-                all_embeddings = self._embedding.embed_batch(all_texts_to_embed)
-            except Exception as e:
-                logger.warning(f"[add_text] Batch embedding failed, falling back to empty: {e}")
-                all_embeddings = [[] for _ in all_texts_to_embed]
+            all_embeddings = self._embedding.embed_batch(all_texts_to_embed)
 
         entity_embeddings = all_embeddings[:len(entities)]
         relation_embeddings = all_embeddings[len(entities):]
@@ -311,7 +307,7 @@ class Neo4jStorage(GraphStorage):
                 fact_embedding = relation_embeddings[idx] if idx < len(relation_embeddings) else []
                 r_uuid = str(uuid.uuid4())
 
-                def _create_relation(tx, _r_uuid=r_uuid, _source_uuid=source_uuid,
+                def _merge_relation(tx, _r_uuid=r_uuid, _source_uuid=source_uuid,
                                      _target_uuid=target_uuid, _rtype=rtype,
                                      _fact=fact, _fact_emb=fact_embedding,
                                      _episode_id=episode_id, _now=now):
@@ -319,19 +315,29 @@ class Neo4jStorage(GraphStorage):
                         """
                         MATCH (src:Entity {uuid: $src_uuid})
                         MATCH (tgt:Entity {uuid: $tgt_uuid})
-                        CREATE (src)-[r:RELATION {
-                            uuid: $uuid,
+                        MERGE (src)-[r:RELATION {
                             graph_id: $gid,
                             name: $name,
-                            fact: $fact,
-                            fact_embedding: $fact_embedding,
-                            attributes_json: '{}',
-                            episode_ids: [$episode_id],
-                            created_at: $now,
-                            valid_at: null,
-                            invalid_at: null,
-                            expired_at: null
+                            fact: $fact
                         }]->(tgt)
+                        ON CREATE SET
+                            r.uuid = $uuid,
+                            r.fact_embedding = $fact_embedding,
+                            r.attributes_json = '{}',
+                            r.episode_ids = [$episode_id],
+                            r.created_at = $now,
+                            r.valid_at = null,
+                            r.invalid_at = null,
+                            r.expired_at = null
+                        ON MATCH SET
+                            r.episode_ids = CASE
+                                WHEN $episode_id IN r.episode_ids THEN r.episode_ids
+                                ELSE r.episode_ids + $episode_id
+                            END,
+                            r.fact_embedding = CASE
+                                WHEN r.fact_embedding IS NULL OR size(r.fact_embedding) = 0
+                                THEN $fact_embedding ELSE r.fact_embedding
+                            END
                         """,
                         src_uuid=_source_uuid,
                         tgt_uuid=_target_uuid,
@@ -344,7 +350,7 @@ class Neo4jStorage(GraphStorage):
                         now=_now,
                     )
 
-                self._call_with_retry(session.execute_write, _create_relation)
+                self._call_with_retry(session.execute_write, _merge_relation)
 
         logger.info(f"[add_text] Chunk done: episode={episode_id}")
         return episode_id

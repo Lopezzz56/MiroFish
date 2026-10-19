@@ -298,7 +298,7 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
         # - completed: Execution complete, preparation already completed
         # - stopped: Stopped, preparation already completed
         # - failed: Execution failed (but preparation is not completed)
-        prepared_statuses = ["ready", "preparing", "running", "completed", "stopped", "failed"]
+        prepared_statuses = ["ready", "preparing", "running", "completed", "stopped", "failed", "paused"]
         if status in prepared_statuses and config_generated:
             # Get file statistics
             profiles_file = os.path.join(simulation_dir, "reddit_profiles.json")

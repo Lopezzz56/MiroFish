@@ -337,6 +337,12 @@
                   <span class="progress-percent">{{ buildProgress.progress }}%</span>
                 </div>
               </div>
+
+              <div class="detail-section" v-if="graphTaskStale">
+                <button class="next-step-btn" @click="startBuildGraph">
+                  Retry interrupted graph build
+                </button>
+              </div>
               
               <div class="detail-section" v-if="graphData">
                 <div class="detail-label">Build Result</div>
@@ -431,6 +437,7 @@ const error = ref('')
 const projectData = ref(null)
 const graphData = ref(null)
 const buildProgress = ref(null)
+const graphTaskStale = ref(false)
 const ontologyProgress = ref(null) // Ontology generation progress
 const currentPhase = ref(-1) // -1: Uploading, 0: Generating ontology, 1: Building graph, 2: Complete
 const selectedItem = ref(null) // Selected node or edge
@@ -676,6 +683,8 @@ const updatePhaseByStatus = (status) => {
 // Start building graph
 const startBuildGraph = async () => {
   try {
+    graphTaskStale.value = false
+    error.value = ''
     currentPhase.value = 1
     // Initialize progress
     buildProgress.value = {
@@ -832,6 +841,14 @@ const pollTaskStatus = async (taskId) => {
       }
     }
   } catch (err) {
+    if (err.response?.status === 404) {
+      stopPolling()
+      stopGraphPolling()
+      buildProgress.value = null
+      graphTaskStale.value = true
+      error.value = 'This graph build was interrupted. Retry to start it again.'
+      return
+    }
     console.error('Poll task error:', err)
   }
 }

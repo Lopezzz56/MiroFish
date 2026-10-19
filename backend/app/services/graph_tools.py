@@ -165,17 +165,23 @@ class InsightForgeResult:
             "total_relationships": self.total_relationships
         }
 
-    def to_text(self) -> str:
+    def to_text(
+        self,
+        max_facts: Optional[int] = None,
+        include_simulation_requirement: bool = True,
+    ) -> str:
         """Convert to detailed text format for LLM understanding"""
         text_parts = [
             f"## Future Prediction Deep Analysis",
             f"Analysis Query: {self.query}",
-            f"Prediction Scenario: {self.simulation_requirement}",
             f"\n### Prediction Data Statistics",
             f"- Related Prediction Facts: {self.total_facts}",
             f"- Involved Entities: {self.total_entities}",
             f"- Relationship Chains: {self.total_relationships}"
         ]
+
+        if include_simulation_requirement:
+            text_parts.insert(2, f"Prediction Scenario: {self.simulation_requirement}")
 
         if self.sub_queries:
             text_parts.append(f"\n### Analysis Sub-Questions")
@@ -184,8 +190,12 @@ class InsightForgeResult:
 
         if self.semantic_facts:
             text_parts.append(f"\n### Key Facts (Please quote these verbatim in the report)")
-            for i, fact in enumerate(self.semantic_facts, 1):
+            facts = self.semantic_facts if max_facts is None else self.semantic_facts[:max_facts]
+            for i, fact in enumerate(facts, 1):
                 text_parts.append(f'{i}. "{fact}"')
+            omitted_facts = len(self.semantic_facts) - len(facts)
+            if omitted_facts:
+                text_parts.append(f"... and {omitted_facts} additional related facts")
 
         if self.entity_insights:
             text_parts.append(f"\n### Core Entities")

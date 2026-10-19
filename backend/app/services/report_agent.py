@@ -19,7 +19,7 @@ from datetime import datetime
 from enum import Enum
 
 from ..config import Config
-from ..utils.llm_client import LLMClient
+from ..utils.llm_client import LLMClient, LLMOutputTruncatedError
 from ..utils.logger import get_logger
 from .graph_tools import (
     GraphToolsService,
@@ -30,6 +30,8 @@ from .graph_tools import (
 )
 
 logger = get_logger('mirofish.report_agent')
+
+_REPORT_MAX_OUTPUT_TOKENS = 800
 
 
 class ReportLogger:
@@ -96,7 +98,13 @@ class ReportLogger:
         with open(self.log_file_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
     
-    def log_start(self, simulation_id: str, graph_id: str, simulation_requirement: str):
+    def log_start(
+        self,
+        simulation_id: str,
+        graph_id: str,
+        simulation_requirement: str,
+        resumed: bool = False,
+    ):
         """Log report generation start"""
         self.log(
             action="report_start",
@@ -105,7 +113,8 @@ class ReportLogger:
                 "simulation_id": simulation_id,
                 "graph_id": graph_id,
                 "simulation_requirement": simulation_requirement,
-                "message": "Report generation task started"
+                "message": "Report generation resumed" if resumed else "Report generation task started",
+                "resumed": resumed,
             }
         )
     
@@ -704,7 +713,7 @@ This section analyzes...
 ```
 
 ═══════════════════════════════════════════════════════════════
-[Available Retrieval Tools] (call 3-5 times per section)
+[Available Retrieval Tools] (use diverse tools without repeating searches)
 ═══════════════════════════════════════════════════════════════
 
 {tools_description}
@@ -875,7 +884,7 @@ class ReportAgent:
     """
     
     # Maximum tool call count (per section)
-    MAX_TOOL_CALLS_PER_SECTION = 5
+    MAX_TOOL_CALLS_PER_SECTION = Config.REPORT_AGENT_MAX_TOOL_CALLS
 
     # Maximum reflection rounds
     MAX_REFLECTION_ROUNDS = 3
@@ -905,7 +914,11 @@ class ReportAgent:
         self.simulation_id = simulation_id
         self.simulation_requirement = simulation_requirement
 
-        self.llm = llm_client or LLMClient()
+        if llm_client:
+            self.llm = llm_client
+        else:
+            api_key, base_url, model = Config.structural_llm_settings()
+            self.llm = LLMClient(api_key=api_key, base_url=base_url, model=model)
         if graph_tools is None:
             raise ValueError(
                 "graph_tools (GraphToolsService) is required. "
@@ -984,7 +997,7 @@ class ReportAgent:
                     simulation_requirement=self.simulation_requirement,
                     report_context=ctx
                 )
-                return result.to_text()
+                return result.to_text(max_facts=10, include_simulation_requirement=False)
             
             elif tool_name == "panorama_search":
                 # Breadth search - get complete panorama
@@ -1117,6 +1130,115 @@ class ReportAgent:
                 pass
 
         return tool_calls
+
+    def _chat_with_continuation(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: int = _REPORT_MAX_OUTPUT_TOKENS,
+    ) -> str:
+        """Continue bounded model responses before parsing tool calls or final text."""
+        conversation = list(messages)
+        response_parts = []
+
+        for continuation in range(3):
+            try:
+                response = self.llm.chat(
+                    messages=conversation,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except LLMOutputTruncatedError as error:
+                partial = error.content.strip()
+                if not partial:
+                    raise
+
+                response_parts.append(partial)
+                conversation.extend([
+                    {"role": "assistant", "content": partial},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Continue exactly where your previous response stopped. "
+                            "Do not repeat any earlier text. Finish the current response "
+                            "in its original format."
+                        ),
+                    },
+                ])
+                continue
+
+            response_parts.append(response)
+            return re.sub(r'<think>[\s\S]*?</think>', '', "".join(response_parts)).strip()
+
+        raise LLMOutputTruncatedError(
+            "LLM response remained truncated after 3 bounded continuations",
+            content="".join(response_parts),
+        )
+
+    @staticmethod
+    def _bound_tool_result(result: str, max_characters: int = 700) -> str:
+        if len(result) <= max_characters:
+            return result
+        omission_marker = "\n...[middle omitted; full result remains in report logs]...\n"
+        end_characters = 140
+        start_characters = max_characters - len(omission_marker) - end_characters
+        return (
+            result[:start_characters]
+            + omission_marker
+            + result[-end_characters:]
+        )
+
+    @staticmethod
+    def _compact_simulation_requirement(requirement: str) -> str:
+        if len(requirement) <= 3000:
+            return requirement
+
+        key_terms = re.compile(
+            r"competitor|Amadeus|GoAudits|Optii|Flexkeeping|hotelkit|Snapfix|"
+            r"OpsAnalitica|SafetyCulture|Axonify|Connecteam|pricing|integrat|"
+            r"buying decision|frontline|SC Training|verified|unknown|evidence|"
+            r"simulation assumption|no predetermined",
+            re.IGNORECASE,
+        )
+        selected_lines = []
+        selected_length = 0
+        for line in requirement.splitlines():
+            if key_terms.search(line):
+                excerpt = line.strip()[:180]
+                if excerpt and selected_length + len(excerpt) <= 1200:
+                    selected_lines.append(excerpt)
+                    selected_length += len(excerpt)
+
+        return "\n".join(
+            part
+            for part in (
+                requirement[:900],
+                "\n[Selected requirements]\n" + "\n".join(selected_lines),
+                "\n[End of brief]\n" + requirement[-700:],
+            )
+            if part
+        )
+
+    @staticmethod
+    def _compact_react_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        if len(messages) <= 2:
+            return messages
+
+        prior_user_context = [
+            message["content"]
+            for message in messages[2:]
+            if message["role"] == "user"
+        ]
+        if not prior_user_context:
+            return messages[:2]
+
+        return [
+            messages[0],
+            {
+                "role": "user",
+                "content": "\n\n".join([messages[1]["content"], *prior_user_context]),
+            },
+        ]
 
     def _is_valid_tool_call(self, data: dict) -> bool:
         """Validate if the parsed JSON is a valid tool call"""
@@ -1262,17 +1384,18 @@ class ReportAgent:
         system_prompt = SECTION_SYSTEM_PROMPT_TEMPLATE.format(
             report_title=outline.title,
             report_summary=outline.summary,
-            simulation_requirement=self.simulation_requirement,
+            simulation_requirement=self._compact_simulation_requirement(
+                self.simulation_requirement
+            ),
             section_title=section.title,
             tools_description=self._get_tools_description(),
         )
 
-        # Build user prompt - pass maximum 4000 characters for each completed section
+        # Keep previous-section context useful without sending full generated sections again.
         if previous_sections:
             previous_parts = []
             for sec in previous_sections:
-                # Maximum 4000 characters per section
-                truncated = sec[:4000] + "..." if len(sec) > 4000 else sec
+                truncated = sec[:700] + "..." if len(sec) > 700 else sec
                 previous_parts.append(truncated)
             previous_content = "\n\n---\n\n".join(previous_parts)
         else:
@@ -1308,10 +1431,10 @@ class ReportAgent:
                 )
             
             # Call LLM
-            response = self.llm.chat(
-                messages=messages,
+            response = self._chat_with_continuation(
+                messages=self._compact_react_messages(messages),
                 temperature=0.5,
-                max_tokens=4096
+                max_tokens=_REPORT_MAX_OUTPUT_TOKENS
             )
 
             # Check if LLM return is None (API exception or empty content)
@@ -1466,7 +1589,7 @@ class ReportAgent:
                     "role": "user",
                     "content": REACT_OBSERVATION_TEMPLATE.format(
                         tool_name=call["name"],
-                        result=result,
+                        result=self._bound_tool_result(result),
                         tool_calls_count=tool_calls_count,
                         max_tool_calls=self.MAX_TOOL_CALLS_PER_SECTION,
                         used_tools_str=", ".join(used_tools),
@@ -1511,10 +1634,10 @@ class ReportAgent:
         logger.warning(f"Section {section.title} reachedmaximumiterationscount，Forcegenerate")
         messages.append({"role": "user", "content": REACT_FORCE_FINAL_MSG})
         
-        response = self.llm.chat(
-            messages=messages,
+        response = self._chat_with_continuation(
+            messages=self._compact_react_messages(messages),
             temperature=0.5,
-            max_tokens=4096
+            max_tokens=_REPORT_MAX_OUTPUT_TOKENS
         )
 
         # Check forceconclusion when LLM return is None
@@ -1540,7 +1663,8 @@ class ReportAgent:
     def generate_report(
         self, 
         progress_callback: Optional[Callable[[str, int, str], None]] = None,
-        report_id: Optional[str] = None
+        report_id: Optional[str] = None,
+        resume: bool = False,
     ) -> Report:
         """
         Generate complete report (realtime output per section)
@@ -1570,81 +1694,124 @@ class ReportAgent:
             report_id = f"report_{uuid.uuid4().hex[:12]}"
         start_time = datetime.now()
         
-        report = Report(
-            report_id=report_id,
-            simulation_id=self.simulation_id,
-            graph_id=self.graph_id,
-            simulation_requirement=self.simulation_requirement,
-            status=ReportStatus.PENDING,
-            created_at=datetime.now().isoformat()
-        )
+        report = ReportManager.get_report(report_id) if resume else None
+        if resume and not report:
+            raise ValueError(f"Cannot resume report that does not exist: {report_id}")
+        if resume and (
+            report.simulation_id != self.simulation_id
+            or report.graph_id != self.graph_id
+        ):
+            raise ValueError("Saved report does not match the requested simulation and graph")
+        if report is None:
+            report = Report(
+                report_id=report_id,
+                simulation_id=self.simulation_id,
+                graph_id=self.graph_id,
+                simulation_requirement=self.simulation_requirement,
+                status=ReportStatus.PENDING,
+                created_at=datetime.now().isoformat()
+            )
+        else:
+            report.status = ReportStatus.PENDING
+            report.error = None
+            report.completed_at = ""
         
         # CompletedSection Titlelist（for progress tracking）
         completed_section_titles = []
+        saved_sections = {}
         
         try:
             # Initialize: Create report folder and save initial state
             ReportManager._ensure_report_folder(report_id)
+
+            if resume:
+                if not report.outline:
+                    raise ValueError("Cannot resume report because its saved outline is missing")
+                for item in ReportManager.get_generated_sections(report_id):
+                    content = item["content"]
+                    body = re.sub(r"^\s*##[^\n]*\n+", "", content, count=1).strip()
+                    if body:
+                        saved_sections[item["section_index"]] = content
+                if any(
+                    index < 1 or index > len(report.outline.sections)
+                    for index in saved_sections
+                ):
+                    raise ValueError("Saved report contains a section outside its outline")
+                for index, section in enumerate(report.outline.sections, start=1):
+                    if index in saved_sections:
+                        section.content = saved_sections[index]
+                        completed_section_titles.append(section.title)
             
             # Initialize logslogger（structured logs agent_log.jsonl）
             self.report_logger = ReportLogger(report_id)
             self.report_logger.log_start(
                 simulation_id=self.simulation_id,
                 graph_id=self.graph_id,
-                simulation_requirement=self.simulation_requirement
+                simulation_requirement=self.simulation_requirement,
+                resumed=resume
             )
-            
+
             # Initialize console logslogger（console_log.txt）
             self.console_logger = ReportConsoleLogger(report_id)
-            
+
             ReportManager.update_progress(
-                report_id, "pending", 0, "Initializereport...",
-                completed_sections=[]
+                report_id, "pending", 0,
+                "Resuming report from saved outline..." if resume else "Initializereport...",
+                completed_sections=completed_section_titles
             )
             ReportManager.save_report(report)
-            
-            # phase1: planoutline
-            report.status = ReportStatus.PLANNING
-            ReportManager.update_progress(
-                report_id, "planning", 5, "Start planning report outline...",
-                completed_sections=[]
-            )
-            
-            # Log outline planning start
-            self.report_logger.log_planning_start()
-            
-            if progress_callback:
-                progress_callback("planning", 0, "Start planning report outline...")
-            
-            outline = self.plan_outline(
-                progress_callback=lambda stage, prog, msg: 
-                    progress_callback(stage, prog // 5, msg) if progress_callback else None
-            )
-            report.outline = outline
-            
-            # recordplancompletion log
-            self.report_logger.log_planning_complete(outline.to_dict())
-            
-            # saveoutlinetofile
-            ReportManager.save_outline(report_id, outline)
-            ReportManager.update_progress(
-                report_id, "planning", 15, f"Outline planning completed, total{len(outline.sections)}sections",
-                completed_sections=[]
-            )
-            ReportManager.save_report(report)
-            
-            logger.info(f"outlinesavedtofile: {report_id}/outline.json")
-            
+
+            if resume:
+                outline = report.outline
+                self.report_logger.log_planning_complete(outline.to_dict())
+                if progress_callback:
+                    progress_callback("planning", 15, "Reusing saved report outline")
+            else:
+                # phase1: planoutline
+                report.status = ReportStatus.PLANNING
+                ReportManager.update_progress(
+                    report_id, "planning", 5, "Start planning report outline...",
+                    completed_sections=[]
+                )
+
+                self.report_logger.log_planning_start()
+
+                if progress_callback:
+                    progress_callback("planning", 0, "Start planning report outline...")
+
+                outline = self.plan_outline(
+                    progress_callback=lambda stage, prog, msg:
+                        progress_callback(stage, prog // 5, msg) if progress_callback else None
+                )
+                report.outline = outline
+
+                self.report_logger.log_planning_complete(outline.to_dict())
+                ReportManager.save_outline(report_id, outline)
+                ReportManager.update_progress(
+                    report_id, "planning", 15, f"Outline planning completed, total{len(outline.sections)}sections",
+                    completed_sections=[]
+                )
+                ReportManager.save_report(report)
+
+                logger.info(f"outlinesavedtofile: {report_id}/outline.json")
+
             # Phase 2: Sequentially generate sectionsgeneration (per sectionsave）
             report.status = ReportStatus.GENERATING
-            
+            ReportManager.save_report(report)
+
             total_sections = len(outline.sections)
-            generated_sections = []  # savecontentfor context
-            
+            generated_sections = [
+                f"## {section.title}\n\n{section.content}"
+                for section in outline.sections
+                if section.content
+            ]
+
             for i, section in enumerate(outline.sections):
                 section_num = i + 1
+                if section_num in saved_sections:
+                    continue
                 base_progress = 20 + int((i / total_sections) * 70)
-                
+
                 # Update progress
                 ReportManager.update_progress(
                     report_id, "generating", base_progress,
@@ -1652,7 +1819,7 @@ class ReportAgent:
                     current_section=section.title,
                     completed_sections=completed_section_titles
                 )
-                
+
                 if progress_callback:
                     progress_callback(
                         "generating", 

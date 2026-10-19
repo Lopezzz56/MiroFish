@@ -5,6 +5,7 @@ Interface 1: Analyze text content and generate entity and relationship type defi
 
 import json
 from typing import Dict, Any, List, Optional
+from ..config import Config
 from ..utils.llm_client import LLMClient
 
 
@@ -162,7 +163,15 @@ class OntologyGenerator:
     """
 
     def __init__(self, llm_client: Optional[LLMClient] = None):
-        self.llm_client = llm_client or LLMClient()
+        if llm_client:
+            self.llm_client = llm_client
+        else:
+            api_key, base_url, model = Config.structural_llm_settings()
+            self.llm_client = LLMClient(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+            )
 
     def generate(
         self,
@@ -205,8 +214,8 @@ class OntologyGenerator:
 
         return result
 
-    # Maximum text length for LLM (50,000 characters)
-    MAX_TEXT_LENGTH_FOR_LLM = 50000
+    # Leave context space for the instructions and generated ontology.
+    MAX_TEXT_LENGTH_FOR_LLM = 10000
 
     def _build_user_message(
         self,
@@ -220,7 +229,7 @@ class OntologyGenerator:
         combined_text = "\n\n---\n\n".join(document_texts)
         original_length = len(combined_text)
 
-        # If text exceeds 50,000 characters, truncate (only affects LLM input, not graph construction)
+        # If text exceeds the analysis limit, truncate only the ontology model input.
         if len(combined_text) > self.MAX_TEXT_LENGTH_FOR_LLM:
             combined_text = combined_text[:self.MAX_TEXT_LENGTH_FOR_LLM]
             combined_text += f"\n\n...(Original text has {original_length} characters, first {self.MAX_TEXT_LENGTH_FOR_LLM} characters extracted for ontology analysis)..."
@@ -446,4 +455,3 @@ Based on the above content, design entity types and relationship types suitable 
         code_lines.append('}')
 
         return '\n'.join(code_lines)
-

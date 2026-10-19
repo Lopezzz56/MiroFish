@@ -43,6 +43,30 @@ export const getReport = (reportId) => {
 }
 
 /**
+ * Retry a failed report using its saved outline and generated sections.
+ * @param {string} reportId
+ */
+export const retryReport = (reportId) => {
+  return service.post(`/api/report/${reportId}/retry`)
+}
+
+/**
+ * Get saved sections for restoring report progress.
+ * @param {string} reportId
+ */
+export const getReportSections = (reportId) => {
+  return service.get(`/api/report/${reportId}/sections`)
+}
+
+/**
+ * Get current report generation progress.
+ * @param {string} reportId
+ */
+export const getReportProgress = (reportId) => {
+  return service.get(`/api/report/${reportId}/progress`)
+}
+
+/**
  * Chat with Report Agent
  * @param {Object} data - { simulation_id, message, chat_history? }
  */

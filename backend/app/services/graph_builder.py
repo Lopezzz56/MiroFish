@@ -192,6 +192,8 @@ class GraphBuilderService:
         """Add text in batches to graph, return uuid list of all episodes"""
         episode_uuids = []
         total_chunks = len(chunks)
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than zero")
         total_batches = (total_chunks + batch_size - 1) // batch_size
 
         logger.info(f"[graph_build] Starting: {total_chunks} chunks, {total_batches} batches (batch_size={batch_size})")
@@ -199,13 +201,6 @@ class GraphBuilderService:
         for i in range(0, total_chunks, batch_size):
             batch_chunks = chunks[i:i + batch_size]
             batch_num = i // batch_size + 1
-
-            if progress_callback:
-                progress = (i + len(batch_chunks)) / total_chunks
-                progress_callback(
-                    f"Processing batch {batch_num}/{total_batches} ({len(batch_chunks)} chunks)...",
-                    progress
-                )
 
             for j, chunk in enumerate(batch_chunks):
                 chunk_idx = i + j + 1
@@ -222,6 +217,12 @@ class GraphBuilderService:
                     logger.info(
                         f"[graph_build] Chunk {chunk_idx}/{total_chunks} done in {elapsed:.1f}s"
                     )
+                    if progress_callback:
+                        progress_callback(
+                            f"Processed chunk {chunk_idx}/{total_chunks} "
+                            f"(batch {batch_num}/{total_batches})",
+                            chunk_idx / total_chunks
+                        )
                 except Exception as e:
                     elapsed = time.time() - t0
                     logger.error(
@@ -229,7 +230,10 @@ class GraphBuilderService:
                         f"after {elapsed:.1f}s: {e}"
                     )
                     if progress_callback:
-                        progress_callback(f"Batch {batch_num} processing failed: {str(e)}", 0)
+                        progress_callback(
+                            f"Chunk {chunk_idx}/{total_chunks} failed: {e}",
+                            (chunk_idx - 1) / total_chunks
+                        )
                     raise
 
         logger.info(f"[graph_build] All {total_chunks} chunks processed successfully")

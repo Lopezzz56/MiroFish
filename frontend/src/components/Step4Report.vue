@@ -10,6 +10,14 @@
             <div class="report-meta">
               <span class="report-tag">Prediction Report</span>
               <span class="report-id">ID: {{ reportId || 'REF-2024-X92' }}</span>
+              <button
+                v-if="isComplete"
+                class="report-download-btn"
+                type="button"
+                @click="downloadReportPdf"
+              >
+                Download PDF
+              </button>
             </div>
             <h1 class="main-title">{{ reportOutline.title }}</h1>
             <p class="sub-title">{{ reportOutline.summary }}</p>
@@ -137,6 +145,16 @@
           </button>
 
           <div class="workflow-divider"></div>
+        </div>
+
+        <div v-if="reportStatus === 'failed'" class="report-retry-panel" role="alert">
+          <div>
+            <strong>Report generation failed</strong>
+            <p>{{ retryError || 'Retry resumes this report from its saved outline and keeps any completed sections.' }}</p>
+          </div>
+          <button class="report-retry-btn" :disabled="retrying" @click="handleRetry">
+            {{ retrying ? 'Starting retry...' : 'Retry report' }}
+          </button>
         </div>
 
         <div class="workflow-timeline">
@@ -392,7 +410,14 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, h, reactive } from 'vue'
 import { useRouter } from 'vue-router'
-import { getAgentLog, getConsoleLog } from '../api/report'
+import {
+  getAgentLog,
+  getConsoleLog,
+  getReport,
+  getReportProgress,
+  getReportSections,
+  retryReport
+} from '../api/report'
 
 const router = useRouter()
 
@@ -411,6 +436,18 @@ const goToInteraction = () => {
   }
 }
 
+const downloadReportPdf = async () => {
+  const previousCollapsedSections = collapsedSections.value
+  collapsedSections.value = new Set()
+  await nextTick()
+
+  const restoreCollapsedSections = () => {
+    collapsedSections.value = previousCollapsedSections
+  }
+  window.addEventListener('afterprint', restoreCollapsedSections, { once: true })
+  window.print()
+}
+
 // State
 const agentLogs = ref([])
 const consoleLogs = ref([])
@@ -423,6 +460,9 @@ const expandedContent = ref(new Set())
 const expandedLogs = ref(new Set())
 const collapsedSections = ref(new Set())
 const isComplete = ref(false)
+const reportStatus = ref('pending')
+const retrying = ref(false)
+const retryError = ref('')
 const startTime = ref(null)
 const leftPanel = ref(null)
 const rightPanel = ref(null)
@@ -1703,12 +1743,14 @@ const QuickSearchDisplay = {
 // Computed
 const statusClass = computed(() => {
   if (isComplete.value) return 'completed'
+  if (reportStatus.value === 'failed') return 'failed'
   if (agentLogs.value.length > 0) return 'processing'
   return 'pending'
 })
 
 const statusText = computed(() => {
   if (isComplete.value) return 'Completed'
+  if (reportStatus.value === 'failed') return 'Failed'
   if (agentLogs.value.length > 0) return 'Generating...'
   return 'Waiting'
 })
@@ -2015,6 +2057,74 @@ const getLogLevelClass = (log) => {
 // Polling
 let agentLogTimer = null
 let consoleLogTimer = null
+let reportStatusTimer = null
+
+const fetchReportState = async (loadSections = false) => {
+  if (!props.reportId) return
+
+  try {
+    const [res, progressRes] = await Promise.all([
+      getReport(props.reportId),
+      getReportProgress(props.reportId)
+    ])
+    const report = res.data?.data
+    if (!res.data?.success || !report) return
+
+    if (report.outline && !reportOutline.value) {
+      reportOutline.value = report.outline
+    }
+    const currentStatus = progressRes.data?.data?.status || report.status
+    reportStatus.value = currentStatus
+    if (currentStatus === 'completed') {
+      isComplete.value = true
+      retryError.value = ''
+      emit('update-status', 'completed')
+    } else if (currentStatus === 'failed') {
+      isComplete.value = false
+      currentSectionIndex.value = null
+      const error = report.error || progressRes.data?.data?.message || ''
+      const retryDelay = error.match(/try again in ([^.]+)/i)?.[1]
+      retryError.value = /tokens per day|\bTPD\b/i.test(error) && retryDelay
+        ? `Groq's daily token quota is exhausted. Try again in ${retryDelay}. Saved sections will be kept.`
+        : error
+      emit('update-status', 'failed')
+    } else {
+      retryError.value = ''
+      emit('update-status', 'processing')
+    }
+
+    if (loadSections) {
+      const sectionsResponse = await getReportSections(props.reportId)
+      const savedSections = sectionsResponse.data?.data?.sections || []
+      generatedSections.value = Object.fromEntries(
+        savedSections.map(section => [section.section_index, section.content])
+      )
+    }
+  } catch (err) {
+    console.warn('Failed to fetch report state:', err)
+  }
+}
+
+const handleRetry = async () => {
+  if (!props.reportId || retrying.value) return
+
+  retrying.value = true
+  retryError.value = ''
+  try {
+    const res = await retryReport(props.reportId)
+    if (!res.data?.success) {
+      throw new Error(res.data?.error || 'Could not start report retry')
+    }
+    reportStatus.value = 'generating'
+    isComplete.value = false
+    emit('update-status', 'processing')
+    startPolling()
+  } catch (err) {
+    retryError.value = err.response?.data?.error || err.message || 'Could not start report retry'
+  } finally {
+    retrying.value = false
+  }
+}
 
 const fetchAgentLog = async () => {
   if (!props.reportId) return
@@ -2154,9 +2264,11 @@ const startPolling = () => {
   
   fetchAgentLog()
   fetchConsoleLog()
+  fetchReportState(true)
   
   agentLogTimer = setInterval(fetchAgentLog, 2000)
   consoleLogTimer = setInterval(fetchConsoleLog, 1500)
+  reportStatusTimer = setInterval(fetchReportState, 3000)
 }
 
 const stopPolling = () => {
@@ -2167,6 +2279,10 @@ const stopPolling = () => {
   if (consoleLogTimer) {
     clearInterval(consoleLogTimer)
     consoleLogTimer = null
+  }
+  if (reportStatusTimer) {
+    clearInterval(reportStatusTimer)
+    reportStatusTimer = null
   }
 }
 
@@ -2195,6 +2311,8 @@ watch(() => props.reportId, (newId) => {
     expandedLogs.value = new Set()
     collapsedSections.value = new Set()
     isComplete.value = false
+    reportStatus.value = 'pending'
+    retryError.value = ''
     startTime.value = null
     
     startPolling()
@@ -2365,6 +2483,23 @@ watch(() => props.reportId, (newId) => {
   align-items: center;
   gap: 12px;
   margin-bottom: 24px;
+}
+
+.report-download-btn {
+  margin-left: auto;
+  padding: 7px 11px;
+  border: 1px solid #D1D5DB;
+  border-radius: 6px;
+  background: #FFFFFF;
+  color: #374151;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.report-download-btn:hover {
+  background: #F9FAFB;
+  border-color: #9CA3AF;
 }
 
 .report-tag {
@@ -2769,6 +2904,12 @@ watch(() => props.reportId, (newId) => {
   background: #ECFDF5;
   border-color: #A7F3D0;
   color: #065F46;
+}
+
+.metric-pill.pill--failed {
+  background: #FEF2F2;
+  border-color: #FECACA;
+  color: #991B1B;
 }
 
 .metric-pill.pill--pending {
@@ -3397,6 +3538,41 @@ watch(() => props.reportId, (newId) => {
   font-size: 14px;
 }
 
+.report-retry-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0 20px 16px;
+  padding: 14px 16px;
+  border: 1px solid #FECACA;
+  border-radius: 8px;
+  background: #FEF2F2;
+  color: #7F1D1D;
+}
+
+.report-retry-panel p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.report-retry-btn {
+  flex: 0 0 auto;
+  padding: 9px 14px;
+  border: 0;
+  border-radius: 6px;
+  background: #991B1B;
+  color: #FFFFFF;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.report-retry-btn:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
 .next-step-btn {
   display: flex;
   align-items: center;
@@ -3425,6 +3601,91 @@ watch(() => props.reportId, (newId) => {
 
 .next-step-btn:hover svg {
   transform: translateX(4px);
+}
+
+@media print {
+  @page {
+    margin: 18mm 16mm;
+  }
+
+  :global(html),
+  :global(body),
+  :global(#app) {
+    width: 100% !important;
+    height: auto !important;
+    min-height: 0 !important;
+    overflow: visible !important;
+    background: #FFFFFF !important;
+  }
+
+  :global(body *) {
+    visibility: hidden !important;
+  }
+
+  :global(.main-view),
+  :global(.content-area),
+  :global(.panel-wrapper),
+  :global(.panel-wrapper.right) {
+    position: static !important;
+    display: block !important;
+    width: 100% !important;
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    overflow: visible !important;
+    opacity: 1 !important;
+    transform: none !important;
+  }
+
+  .report-panel,
+  .report-panel * {
+    visibility: visible !important;
+  }
+
+  .report-panel {
+    position: absolute !important;
+    top: 0 !important;
+    left: 0 !important;
+    display: block !important;
+    width: 100% !important;
+    height: auto !important;
+    min-height: 0 !important;
+    overflow: visible !important;
+    background: #FFFFFF !important;
+  }
+
+  .main-split-layout {
+    display: block !important;
+    overflow: visible !important;
+  }
+
+  .left-panel.report-style {
+    display: block !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    height: auto !important;
+    overflow: visible !important;
+    padding: 0 !important;
+    border: 0 !important;
+  }
+
+  .report-content-wrapper {
+    max-width: none !important;
+  }
+
+  .right-panel,
+  .report-download-btn {
+    display: none !important;
+  }
+
+  .section-body {
+    display: block !important;
+    overflow: visible !important;
+  }
+
+  .section-header-row {
+    break-after: avoid;
+  }
 }
 
 /* Workflow Empty */

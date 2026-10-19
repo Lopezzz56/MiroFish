@@ -32,6 +32,21 @@ class Config:
     LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'http://localhost:11434/v1')
     LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'qwen2.5:32b')
 
+    # Optional Groq routing. Empty model keeps structural tasks on the configured local LLM.
+    GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
+    GROQ_BASE_URL = os.environ.get(
+        'GROQ_BASE_URL', 'https://api.groq.com/openai/v1'
+    )
+    GROQ_ONTOLOGY_MODEL = os.environ.get('GROQ_ONTOLOGY_MODEL', '')
+    GROQ_SIMULATION_MODEL = os.environ.get('GROQ_SIMULATION_MODEL', '')
+    GROQ_GRAPH_MODEL = os.environ.get('GROQ_GRAPH_MODEL', '')
+    GROQ_GRAPH_FREE_TIER_CONFIRMED = (
+        os.environ.get('GROQ_GRAPH_FREE_TIER_CONFIRMED', '').lower() == 'true'
+    )
+    GROQ_GRAPH_TIMEOUT_SECONDS = float(
+        os.environ.get('GROQ_GRAPH_TIMEOUT_SECONDS', '90')
+    )
+
     # Neo4j configuration
     NEO4J_URI = os.environ.get('NEO4J_URI', 'bolt://localhost:7687')
     NEO4J_USER = os.environ.get('NEO4J_USER', 'neo4j')
@@ -47,8 +62,8 @@ class Config:
     ALLOWED_EXTENSIONS = {'pdf', 'md', 'txt', 'markdown'}
 
     # Text processing configuration
-    DEFAULT_CHUNK_SIZE = 500  # Default chunk size
-    DEFAULT_CHUNK_OVERLAP = 50  # Default overlap size
+    DEFAULT_CHUNK_SIZE = 2000
+    DEFAULT_CHUNK_OVERLAP = 200
 
     # OASIS simulation configuration
     OASIS_DEFAULT_MAX_ROUNDS = int(os.environ.get('OASIS_DEFAULT_MAX_ROUNDS', '10'))
@@ -65,9 +80,24 @@ class Config:
     ]
 
     # Report Agent configuration
-    REPORT_AGENT_MAX_TOOL_CALLS = int(os.environ.get('REPORT_AGENT_MAX_TOOL_CALLS', '5'))
+    REPORT_AGENT_MAX_TOOL_CALLS = int(os.environ.get('REPORT_AGENT_MAX_TOOL_CALLS', '3'))
     REPORT_AGENT_MAX_REFLECTION_ROUNDS = int(os.environ.get('REPORT_AGENT_MAX_REFLECTION_ROUNDS', '2'))
     REPORT_AGENT_TEMPERATURE = float(os.environ.get('REPORT_AGENT_TEMPERATURE', '0.5'))
+
+    @classmethod
+    def structural_llm_settings(cls):
+        """Use Groq for structural tasks only when its ontology model is configured."""
+        if cls.GROQ_ONTOLOGY_MODEL:
+            if not cls.GROQ_API_KEY:
+                raise ValueError(
+                    "Set GROQ_API_KEY to enable Groq for structural tasks"
+                )
+            return (
+                cls.GROQ_API_KEY,
+                cls.GROQ_BASE_URL,
+                cls.GROQ_ONTOLOGY_MODEL,
+            )
+        return cls.LLM_API_KEY, cls.LLM_BASE_URL, cls.LLM_MODEL_NAME
 
     @classmethod
     def validate(cls):

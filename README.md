@@ -4,9 +4,9 @@
 
 # MiroFish-Offline
 
-**Fully local fork of [MiroFish](https://github.com/666ghj/MiroFish) — no cloud APIs required. English UI.**
+**English-language fork of [MiroFish](https://github.com/666ghj/MiroFish) — local-first, with optional Groq routing for supported stages.**
 
-*A multi-agent swarm intelligence engine that simulates public opinion, market sentiment, and social dynamics. Entirely on your hardware.*
+*A multi-agent simulation engine for exploring public opinion, market sentiment, and social dynamics, using local models where practical.*
 
 [![GitHub Stars](https://img.shields.io/github/stars/nikmcfly/MiroFish-Offline?style=flat-square&color=DAA520)](https://github.com/nikmcfly/MiroFish-Offline/stargazers)
 [![GitHub Forks](https://img.shields.io/github/forks/nikmcfly/MiroFish-Offline?style=flat-square)](https://github.com/nikmcfly/MiroFish-Offline/network)
@@ -19,22 +19,22 @@
 
 MiroFish is a multi-agent simulation engine: upload any document (press release, policy draft, financial report), and it generates hundreds of AI agents with unique personalities that simulate the public reaction on social media. Posts, arguments, opinion shifts — hour by hour.
 
-The [original MiroFish](https://github.com/666ghj/MiroFish) was built for the Chinese market (Chinese UI, Zep Cloud for knowledge graphs, DashScope API). This fork makes it **fully local and fully English**:
+The [original MiroFish](https://github.com/666ghj/MiroFish) uses a different UI language and cloud services. This fork provides an **English UI** and replaces Zep Cloud graph storage with local Neo4j:
 
-| Original MiroFish | MiroFish-Offline |
+| Original project | MiroFish-Offline |
 |---|---|
-| Chinese UI | **English UI** (1,000+ strings translated) |
+| Original-language UI | **English UI** |
 | Zep Cloud (graph memory) | **Neo4j Community Edition 5.15** |
-| DashScope / OpenAI API (LLM) | **Ollama** (qwen2.5, llama3, etc.) |
+| DashScope / OpenAI API (LLM) | **Ollama**, with optional **Groq** routing |
 | Zep Cloud embeddings | **nomic-embed-text** via Ollama |
-| Cloud API keys required | **Zero cloud dependencies** |
+| Cloud graph services | **Local Neo4j graph storage** |
 
 ## Workflow
 
-1. **Graph Build** — Extracts entities (people, companies, events) and relationships from your document. Builds a knowledge graph with individual and group memory via Neo4j.
+1. **Graph Build** — Extracts entities (people, companies, events) and relationships from your document. Ontology analysis samples up to 10,000 characters for model context; the full document is retained for graph construction. Builds a knowledge graph with individual and group memory via Neo4j.
 2. **Env Setup** — Generates hundreds of agent personas, each with unique personality, opinion bias, reaction speed, influence level, and memory of past events.
 3. **Simulation** — Agents interact on simulated social platforms: posting, replying, arguing, shifting opinions. The system tracks sentiment evolution, topic propagation, and influence dynamics in real time.
-4. **Report** — A ReportAgent analyzes the post-simulation environment, interviews a focus group of agents, searches the knowledge graph for evidence, and generates a structured analysis.
+4. **Report** — A ReportAgent analyzes the simulated environment, can interview simulation agents, searches the knowledge graph for evidence, and generates a structured analysis.
 5. **Interaction** — Chat with any agent from the simulated world. Ask them why they posted what they posted. Full memory and personality persists.
 
 ## Screenshot
@@ -57,15 +57,15 @@ git clone https://github.com/nikmcfly/MiroFish-Offline.git
 cd MiroFish-Offline
 cp .env.example .env
 
-# Start all services (Neo4j, Ollama, MiroFish)
+# Start the app and Neo4j (Ollama runs natively on your machine)
 docker compose up -d
 
-# Pull the required models into Ollama
-docker exec mirofish-ollama ollama pull qwen2.5:32b
-docker exec mirofish-ollama ollama pull nomic-embed-text
+# Pull the required models into your local Ollama
+ollama pull qwen3.5:9b
+ollama pull nomic-embed-text
 ```
 
-Open `http://localhost:3000` — that's it.
+Make sure Ollama is running and listening on port 11434. Open `http://localhost:3000`.
 
 ### Option B: Manual
 
@@ -78,12 +78,12 @@ docker run -d --name neo4j \
   neo4j:5.15-community
 ```
 
-**2. Start Ollama & pull models**
+**2. Start Ollama on your machine & pull models**
 
 ```bash
 ollama serve &
-ollama pull qwen2.5:32b      # LLM (or qwen2.5:14b for less VRAM)
-ollama pull nomic-embed-text  # Embeddings (768d)
+ollama pull qwen3.5:9b
+ollama pull nomic-embed-text
 ```
 
 **3. Configure & run backend**
@@ -112,10 +112,10 @@ Open `http://localhost:3000`.
 All settings are in `.env` (copy from `.env.example`):
 
 ```bash
-# LLM — points to local Ollama (OpenAI-compatible API)
+# Docker: host.docker.internal points to Ollama running on the host machine.
 LLM_API_KEY=ollama
-LLM_BASE_URL=http://localhost:11434/v1
-LLM_MODEL_NAME=qwen2.5:32b
+LLM_BASE_URL=http://host.docker.internal:11434/v1
+LLM_MODEL_NAME=qwen3.5:9b
 
 # Neo4j
 NEO4J_URI=bolt://localhost:7687
@@ -124,10 +124,19 @@ NEO4J_PASSWORD=mirofish
 
 # Embeddings
 EMBEDDING_MODEL=nomic-embed-text
-EMBEDDING_BASE_URL=http://localhost:11434
+EMBEDDING_BASE_URL=http://host.docker.internal:11434
+
+# Optional provider routing. Groq is used only for stages with a configured model.
+GROQ_API_KEY=
+GROQ_BASE_URL=https://api.groq.com/openai/v1
+GROQ_ONTOLOGY_MODEL=
+GROQ_SIMULATION_MODEL=
+GROQ_GRAPH_MODEL=
+GROQ_GRAPH_FREE_TIER_CONFIRMED=false
+GROQ_GRAPH_TIMEOUT_SECONDS=90
 ```
 
-Works with any OpenAI-compatible API — swap Ollama for Claude, GPT, or any other provider by changing `LLM_BASE_URL` and `LLM_API_KEY`.
+Groq ontology routing activates when `GROQ_ONTOLOGY_MODEL` is set and requires `GROQ_API_KEY`; Groq simulation routing is configured independently with `GROQ_SIMULATION_MODEL`. Graph extraction has its own `GROQ_GRAPH_MODEL` and requires Groq to be configured. Before enabling it, check your account's model access, pricing, and quotas, then set `GROQ_GRAPH_FREE_TIER_CONFIRMED=true` only if you have verified the selected model is covered by your free tier. In my testing from India, Alibaba/DashScope was not available in my setup, while a Groq-hosted Qwen model worked on the free tier at the time. Provider availability and free-tier limits vary by account and can change. Graph extraction uses bounded 2,000-character chunks with 200-character overlap; local Ollama handles embeddings and can run the other configured stages. For native Windows backend runs, use `http://localhost:11434` instead of `host.docker.internal`. Ontology analysis samples up to 10,000 characters; the original document remains intact for graph construction.
 
 ## Architecture
 
@@ -152,7 +161,7 @@ This fork introduces a clean abstraction layer between the application and the g
 │    │   Neo4jStorage     │                │
 │    │  ┌───────────────┐ │                │
 │    │  │ EmbeddingService│ ← Ollama       │
-│    │  │ NERExtractor   │ ← Ollama LLM   │
+│    │  │ NERExtractor   │ ← Configured LLM│
 │    │  │ SearchService  │ ← Hybrid search │
 │    │  └───────────────┘ │                │
 │    └───────────────────┘                │
@@ -169,7 +178,7 @@ This fork introduces a clean abstraction layer between the application and the g
 - `GraphStorage` is an abstract interface — swap Neo4j for any other graph DB by implementing one class
 - Dependency injection via Flask `app.extensions` — no global singletons
 - Hybrid search: 0.7 × vector similarity + 0.3 × BM25 keyword search
-- Synchronous NER/RE extraction via local LLM (replaces Zep's async episodes)
+- Synchronous NER/RE extraction via the configured provider, using bounded overlapping chunks (replaces Zep's async episodes)
 - All original dataclasses and LLM tools (InsightForge, Panorama, Agent Interviews) preserved
 
 ## Hardware Requirements
@@ -181,14 +190,20 @@ This fork introduces a clean abstraction layer between the application and the g
 | Disk | 20 GB | 50 GB |
 | CPU | 4 cores | 8+ cores |
 
-CPU-only mode works but is significantly slower for LLM inference. For lighter setups, use `qwen2.5:14b` or `qwen2.5:7b`.
+CPU-only mode works but is significantly slower for LLM inference. For lighter setups, use a smaller model supported by your Ollama installation.
+
+## Testing Notes
+
+I tested the workflow with Ollama `qwen3.5:9b` locally and a Groq-hosted Qwen 27B model. Both paths can be slow: the application runs several model-backed stages, and local inference depends heavily on available hardware. The larger Groq model produced thorough results in my tests, but generation took time and ran into provider token limits.
+
+Longer runs use bounded document chunks with overlap, smaller report prompts, and compacted retrieval context to reduce request sizes. These strategies help with provider limits, but do not remove rate limits or guarantee fast generation. Allow time for graph construction and report generation.
 
 ## Use Cases
 
 - **PR crisis testing** — simulate the public reaction to a press release before publishing
 - **Trading signal generation** — feed financial news and observe simulated market sentiment
 - **Policy impact analysis** — test draft regulations against simulated public response
-- **Creative experiments** — someone fed it a classical Chinese novel with a lost ending; the agents wrote a narratively consistent conclusion
+- **Creative experiments** — explore how simulated agents respond to fictional scenarios and story prompts
 
 ## License
 
@@ -200,6 +215,6 @@ This is a modified fork of [MiroFish](https://github.com/666ghj/MiroFish) by [66
 
 **Modifications in this fork:**
 - Backend migrated from Zep Cloud to local Neo4j CE 5.15 + Ollama
-- Entire frontend translated from Chinese to English (20 files, 1,000+ strings)
+- Frontend translated into English
 - All Zep references replaced with Neo4j across the UI
 - Rebranded to MiroFish Offline

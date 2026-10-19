@@ -15,12 +15,89 @@ from ..services.simulation_manager import SimulationManager
 from ..models.project import ProjectManager
 from ..models.task import TaskManager, TaskStatus
 from ..services.graph_tools import GraphToolsService
+from ..utils.llm_client import LLMClient
 from ..utils.logger import get_logger
 
 logger = get_logger('mirofish.api.report')
+_ACTIVE_REPORTS = set()
+_ACTIVE_REPORTS_LOCK = threading.Lock()
 
 
 # ============== Report Generation Interface ==============
+
+def _start_report_generation(
+    report_id: str,
+    simulation_id: str,
+    graph_id: str,
+    simulation_requirement: str,
+    resume: bool = False,
+):
+    storage = current_app.extensions.get('neo4j_storage')
+    if not storage:
+        return None, (jsonify({"success": False, "error": "GraphStorage not initialized — check Neo4j connection"}), 500)
+    api_key, base_url, model = Config.structural_llm_settings()
+    graph_tools = GraphToolsService(
+        storage=storage,
+        llm_client=LLMClient(api_key=api_key, base_url=base_url, model=model),
+    )
+
+    with _ACTIVE_REPORTS_LOCK:
+        if report_id in _ACTIVE_REPORTS:
+            return None, (jsonify({"success": False, "error": "Report generation is already running"}), 409)
+        _ACTIVE_REPORTS.add(report_id)
+
+    task_manager = TaskManager()
+    task_id = task_manager.create_task(
+        task_type="report_generate",
+        metadata={"simulation_id": simulation_id, "graph_id": graph_id, "report_id": report_id}
+    )
+
+    def run_generate():
+        try:
+            task_manager.update_task(task_id, status=TaskStatus.PROCESSING, progress=0, message="Initializing Report Agent...")
+            agent = ReportAgent(
+                graph_id=graph_id,
+                simulation_id=simulation_id,
+                simulation_requirement=simulation_requirement,
+                graph_tools=graph_tools
+            )
+            def progress_callback(stage, progress, message):
+                task_manager.update_task(task_id, progress=progress, message=f"[{stage}] {message}")
+            report = agent.generate_report(
+                progress_callback=progress_callback,
+                report_id=report_id,
+                resume=resume
+            )
+            ReportManager.save_report(report)
+            if report.status == ReportStatus.COMPLETED:
+                task_manager.complete_task(task_id, result={"report_id": report.report_id, "simulation_id": simulation_id, "status": "completed"})
+            else:
+                task_manager.fail_task(task_id, report.error or "Report generation failed")
+        except Exception as e:
+            logger.error(f"Report generation failed: {str(e)}")
+            task_manager.fail_task(task_id, str(e))
+        finally:
+            with _ACTIVE_REPORTS_LOCK:
+                _ACTIVE_REPORTS.discard(report_id)
+
+    try:
+        thread = threading.Thread(target=run_generate, daemon=True)
+        thread.start()
+    except Exception:
+        with _ACTIVE_REPORTS_LOCK:
+            _ACTIVE_REPORTS.discard(report_id)
+        raise
+
+    return {
+        "simulation_id": simulation_id,
+        "report_id": report_id,
+        "task_id": task_id,
+        "status": "generating",
+        "message": "Report generation task started. Query progress via /api/report/generate/status",
+        "already_generated": False,
+        "resumed": resume,
+    }, None
+
 
 @report_bp.route('/generate', methods=['POST'])
 def generate_report():
@@ -62,54 +139,43 @@ def generate_report():
         import uuid
         report_id = f"report_{uuid.uuid4().hex[:12]}"
 
-        task_manager = TaskManager()
-        task_id = task_manager.create_task(
-            task_type="report_generate",
-            metadata={"simulation_id": simulation_id, "graph_id": graph_id, "report_id": report_id}
+        response, error = _start_report_generation(
+            report_id, simulation_id, graph_id, simulation_requirement
         )
-
-        # Initialize graph_tools in Flask context BEFORE spawning thread
-        # (current_app is not available inside background threads)
-        storage = current_app.extensions.get('neo4j_storage')
-        if not storage:
-            return jsonify({"success": False, "error": "GraphStorage not initialized — check Neo4j connection"}), 500
-        graph_tools = GraphToolsService(storage=storage)
-
-        def run_generate():
-            try:
-                task_manager.update_task(task_id, status=TaskStatus.PROCESSING, progress=0, message="Initializing Report Agent...")
-                agent = ReportAgent(
-                    graph_id=graph_id,
-                    simulation_id=simulation_id,
-                    simulation_requirement=simulation_requirement,
-                    graph_tools=graph_tools
-                )
-                def progress_callback(stage, progress, message):
-                    task_manager.update_task(task_id, progress=progress, message=f"[{stage}] {message}")
-                report = agent.generate_report(progress_callback=progress_callback, report_id=report_id)
-                ReportManager.save_report(report)
-                if report.status == ReportStatus.COMPLETED:
-                    task_manager.complete_task(task_id, result={"report_id": report.report_id, "simulation_id": simulation_id, "status": "completed"})
-                else:
-                    task_manager.fail_task(task_id, report.error or "Report generation failed")
-            except Exception as e:
-                logger.error(f"Report generation failed: {str(e)}")
-                task_manager.fail_task(task_id, str(e))
-
-        thread = threading.Thread(target=run_generate, daemon=True)
-        thread.start()
-
-        return jsonify({"success": True, "data": {
-            "simulation_id": simulation_id,
-            "report_id": report_id,
-            "task_id": task_id,
-            "status": "generating",
-            "message": "Report generation task started. Query progress via /api/report/generate/status",
-            "already_generated": False
-        }})
+        if error:
+            return error
+        return jsonify({"success": True, "data": response})
 
     except Exception as e:
         logger.error(f"Failed to start report generation task: {str(e)}")
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+
+
+@report_bp.route('/<report_id>/retry', methods=['POST'])
+def retry_report(report_id: str):
+    try:
+        report = ReportManager.get_report(report_id)
+        if not report:
+            return jsonify({"success": False, "error": f"Report does not exist: {report_id}"}), 404
+        if report.status == ReportStatus.COMPLETED:
+            return jsonify({"success": False, "error": "Completed reports cannot be retried"}), 409
+        if not report.outline:
+            return jsonify({"success": False, "error": "This report has no saved outline to resume"}), 409
+        if not report.graph_id or not report.simulation_requirement:
+            return jsonify({"success": False, "error": "Saved report is missing its graph or simulation requirement"}), 409
+
+        response, error = _start_report_generation(
+            report_id,
+            report.simulation_id,
+            report.graph_id,
+            report.simulation_requirement,
+            resume=True,
+        )
+        if error:
+            return error
+        return jsonify({"success": True, "data": response})
+    except Exception as e:
+        logger.error(f"Failed to retry report generation: {str(e)}")
         return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
 

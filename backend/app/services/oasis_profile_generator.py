@@ -185,9 +185,10 @@ class OasisProfileGenerator:
         storage: Optional[GraphStorage] = None,
         graph_id: Optional[str] = None
     ):
-        self.api_key = api_key or Config.LLM_API_KEY
-        self.base_url = base_url or Config.LLM_BASE_URL
-        self.model_name = model_name or Config.LLM_MODEL_NAME
+        default_api_key, default_base_url, default_model = Config.structural_llm_settings()
+        self.api_key = api_key or default_api_key
+        self.base_url = base_url or default_base_url
+        self.model_name = model_name or default_model
 
         if not self.api_key:
             raise ValueError("LLM_API_KEY not configured")
@@ -1137,4 +1138,3 @@ Important:
         """[Deprecated] Please use save_profiles() method"""
         logger.warning("save_profiles_to_json is deprecated, please use save_profiles method")
         self.save_profiles(profiles, file_path, platform)
-

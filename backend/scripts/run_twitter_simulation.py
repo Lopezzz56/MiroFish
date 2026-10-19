@@ -433,10 +433,21 @@ class TwitterSimulationRunner:
         - LLM_BASE_URL: API base URL
         - LLM_MODEL_NAME: Model name
         """
-        # Read configuration from .env first
-        llm_api_key = os.environ.get("LLM_API_KEY", "")
-        llm_base_url = os.environ.get("LLM_BASE_URL", "")
-        llm_model = os.environ.get("LLM_MODEL_NAME", "")
+        # Use Groq for repeated simulation rounds only when explicitly configured.
+        llm_api_key = os.environ.get("GROQ_API_KEY", "")
+        llm_base_url = os.environ.get("GROQ_BASE_URL", "")
+        llm_model = os.environ.get("GROQ_SIMULATION_MODEL", "")
+
+        if bool(llm_api_key) != bool(llm_model):
+            raise ValueError(
+                "Set both GROQ_API_KEY and GROQ_SIMULATION_MODEL to enable Groq simulation"
+            )
+
+        # Otherwise preserve the existing local model configuration.
+        if not llm_api_key:
+            llm_api_key = os.environ.get("LLM_API_KEY", "")
+            llm_base_url = os.environ.get("LLM_BASE_URL", "")
+            llm_model = os.environ.get("LLM_MODEL_NAME", "")
         
         # If not in .env, use config as fallback
         if not llm_model:

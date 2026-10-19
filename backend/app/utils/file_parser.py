@@ -160,6 +160,11 @@ def split_text_into_chunks(
     Returns:
         List of text chunks
     """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than zero")
+    if overlap < 0 or overlap >= chunk_size:
+        raise ValueError("overlap must be non-negative and smaller than chunk_size")
+
     if len(text) <= chunk_size:
         return [text] if text.strip() else []
 
@@ -186,4 +191,3 @@ def split_text_into_chunks(
         start = end - overlap if end < len(text) else len(text)
 
     return chunks
-
